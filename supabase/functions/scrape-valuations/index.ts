@@ -1,5 +1,4 @@
 import { createClient } from 'npm:@supabase/supabase-js@2.58.0';
-import * as cheerio from 'npm:cheerio@1.1.2';
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
@@ -45,24 +44,36 @@ Deno.serve(async (req: Request) => {
       Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
     );
 
+    const perplexityApiKey = Deno.env.get('PERPLEXITY_API_KEY');
+
+    if (!perplexityApiKey) {
+      return new Response(
+        JSON.stringify({ error: 'Perplexity API key not configured' }),
+        {
+          status: 500,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        }
+      );
+    }
+
     const sources = [
-      { name: '28Hse', url: 'https://www.28hse.com/en/valuation/' },
-      { name: 'Bank of China (HK)', url: 'https://www.bochk.com/en/mortgage/expert/expert2.html' },
-      { name: 'Hang Seng Bank', url: 'https://www.hangseng.com/en-hk/e-valuation/keyword-search/' },
-      { name: 'HSBC', url: 'https://www.hsbc.com.hk/mortgages/tools/property-valuation/' },
-      { name: 'Standard Chartered Bank', url: 'https://www.sc.com/hk/others/property-valuation.html' },
+      'HSBC Hong Kong',
+      'Hang Seng Bank',
+      'Bank of China (Hong Kong)',
+      'Standard Chartered Hong Kong',
+      'Centaline Property',
     ];
 
     const results: ValuationResult[] = [];
 
     for (const source of sources) {
       try {
-        const valuation = await scrapeValuation(source.name, source.url, address);
+        const valuation = await getValuationFromPerplexity(source, address, perplexityApiKey);
         results.push(valuation);
 
         await supabase.from('valuations').insert({
           address,
-          source: source.name,
+          source: source,
           valuation_amount: valuation.valuation_amount,
           status: valuation.status,
           error_message: valuation.error_message,
@@ -70,7 +81,7 @@ Deno.serve(async (req: Request) => {
         });
       } catch (error) {
         const errorResult: ValuationResult = {
-          source: source.name,
+          source: source,
           valuation_amount: null,
           status: 'error',
           error_message: error.message || 'Unknown error',
@@ -79,7 +90,7 @@ Deno.serve(async (req: Request) => {
 
         await supabase.from('valuations').insert({
           address,
-          source: source.name,
+          source: source,
           valuation_amount: null,
           status: 'error',
           error_message: error.message,
@@ -123,126 +134,87 @@ Deno.serve(async (req: Request) => {
   }
 });
 
-async function scrapeValuation(
+async function getValuationFromPerplexity(
   source: string,
-  url: string,
-  address: string
+  address: string,
+  apiKey: string
 ): Promise<ValuationResult> {
-  const timeout = 15000;
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeout);
+  const prompt = `What is the current property valuation estimate from ${source} for the property at "${address}" in Hong Kong? Please provide only the numerical value in Hong Kong Dollars (HKD). If you find a valuation, respond with just the number without currency symbols or commas. If no valuation is available, respond with "NOT_AVAILABLE". Focus on getting the most recent valuation data from ${source}'s property valuation service or mortgage calculator.`;
 
   try {
-    const response = await fetch(url, {
-      method: 'GET',
+    const response = await fetch('https://api.perplexity.ai/chat/completions', {
+      method: 'POST',
       headers: {
-        'User-Agent':
-          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
       },
-      signal: controller.signal,
+      body: JSON.stringify({
+        model: 'sonar',
+        messages: [
+          {
+            role: 'system',
+            content: 'You are a property valuation assistant. Provide only numerical values or "NOT_AVAILABLE". Do not include explanations.',
+          },
+          {
+            role: 'user',
+            content: prompt,
+          },
+        ],
+        temperature: 0.2,
+        max_tokens: 100,
+      }),
     });
 
-    clearTimeout(timeoutId);
-
     if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`Perplexity API error: ${response.status} - ${errorText}`);
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content?.trim();
+
+    if (!content) {
       return {
         source,
         valuation_amount: null,
         status: 'error',
-        error_message: `HTTP ${response.status}`,
+        error_message: 'Empty response from API',
       };
     }
 
-    const html = await response.text();
-    const $ = cheerio.load(html);
-
-    let valuation: number | null = null;
-
-    switch (source) {
-      case '28Hse':
-        valuation = extractValuationGeneric($, ['valuation', 'price', 'value']);
-        break;
-      case 'Bank of China (HK)':
-        valuation = extractValuationGeneric($, ['valuation', 'price', 'value']);
-        break;
-      case 'Hang Seng Bank':
-        valuation = extractValuationGeneric($, ['valuation', 'price', 'value']);
-        break;
-      case 'HSBC':
-        valuation = extractValuationGeneric($, ['valuation', 'price', 'value']);
-        break;
-      case 'Standard Chartered Bank':
-        valuation = extractValuationGeneric($, ['valuation', 'price', 'value']);
-        break;
-      default:
-        return {
-          source,
-          valuation_amount: null,
-          status: 'not_available',
-          error_message: 'Source not supported',
-        };
-    }
-
-    if (valuation && valuation > 0) {
-      return {
-        source,
-        valuation_amount: valuation,
-        status: 'success',
-      };
-    } else {
+    if (content.toUpperCase().includes('NOT_AVAILABLE') || content.toUpperCase().includes('NOT AVAILABLE')) {
       return {
         source,
         valuation_amount: null,
         status: 'not_available',
-        error_message: 'Valuation data requires interactive form submission',
+        error_message: 'No valuation data available from this source',
       };
     }
+
+    const numberMatch = content.match(/[\d,]+(?:\.\d+)?/);
+    if (numberMatch) {
+      const value = parseFloat(numberMatch[0].replace(/,/g, ''));
+      if (value > 0 && value < 1000000000) {
+        return {
+          source,
+          valuation_amount: value,
+          status: 'success',
+        };
+      }
+    }
+
+    return {
+      source,
+      valuation_amount: null,
+      status: 'not_available',
+      error_message: 'Could not parse valuation from response',
+    };
   } catch (error) {
-    clearTimeout(timeoutId);
-    if (error.name === 'AbortError') {
-      return {
-        source,
-        valuation_amount: null,
-        status: 'error',
-        error_message: 'Request timeout',
-      };
-    }
     return {
       source,
       valuation_amount: null,
       status: 'error',
-      error_message: error.message || 'Scraping failed',
+      error_message: error.message || 'API request failed',
     };
   }
-}
-
-function extractValuationGeneric($: cheerio.CheerioAPI, keywords: string[]): number | null {
-  const text = $('body').text();
-
-  for (const keyword of keywords) {
-    const regex = new RegExp(
-      `${keyword}[:\s]*HK\$?\s*([0-9,]+(?:\.[0-9]{1,2})?)`,
-      'gi'
-    );
-    const match = regex.exec(text);
-    if (match && match[1]) {
-      const value = parseFloat(match[1].replace(/,/g, ''));
-      if (value > 0) {
-        return value;
-      }
-    }
-  }
-
-  const priceRegex = /HK\$\s*([0-9,]+(?:\.[0-9]{1,2})?)/gi;
-  const matches = text.matchAll(priceRegex);
-  for (const match of matches) {
-    if (match[1]) {
-      const value = parseFloat(match[1].replace(/,/g, ''));
-      if (value > 100000) {
-        return value;
-      }
-    }
-  }
-
-  return null;
 }
