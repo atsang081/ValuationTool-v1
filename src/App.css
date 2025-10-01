@@ -46,6 +46,9 @@
 .error-message p {
   color: #c53030;
   font-weight: 500;
+  white-space: pre-line;
+  line-height: 1.6;
+  margin: 0;
 }
 
 @media (max-width: 768px) {

@@ -20,27 +20,51 @@ function App() {
     setResults(null);
 
     try {
-      const sessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+      const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 
-      const apiUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/scrape-valuations`;
+      if (!supabaseUrl || !supabaseKey) {
+        throw new Error('Supabase configuration is missing. Please check your environment variables.');
+      }
+
+      const sessionId = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const apiUrl = `${supabaseUrl}/functions/v1/scrape-valuations`;
 
       const response = await fetch(apiUrl, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+          'Authorization': `Bearer ${supabaseKey}`,
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({ address, sessionId }),
       });
 
       if (!response.ok) {
-        throw new Error('Failed to fetch valuations');
+        const errorText = await response.text();
+        let errorMessage = 'Failed to fetch valuations';
+
+        try {
+          const errorData = JSON.parse(errorText);
+          errorMessage = errorData.error || errorMessage;
+        } catch {
+          errorMessage = `Server error (${response.status}): ${errorText || response.statusText}`;
+        }
+
+        throw new Error(errorMessage);
       }
 
       const data = await response.json();
       setResults(data);
     } catch (err) {
-      setError(err.message);
+      console.error('Valuation fetch error:', err);
+
+      let userMessage = err.message;
+
+      if (err.message === 'Failed to fetch' || err.name === 'TypeError') {
+        userMessage = 'Unable to connect to the valuation service. This could be due to:\n• Network connectivity issues\n• Invalid Supabase configuration\n• CORS restrictions\n\nPlease check your internet connection and Supabase setup.';
+      }
+
+      setError(userMessage);
     } finally {
       setLoading(false);
     }
